@@ -358,7 +358,7 @@ def _find_root_partition(loop_dev: str) -> str:
     best_size = 0
 
     # Check partitions
-    for suffix in ["p1", "p2", "p3", "1", "2", "3"]:
+    for suffix in ["p1", "p2", "p3","p4", "1", "2", "3", "4"]:
         dev = f"{loop_dev}{suffix}"
         if not os.path.exists(dev):
             continue
