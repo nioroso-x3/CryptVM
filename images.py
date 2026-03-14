@@ -4,6 +4,13 @@ All URLs verified as of March 2026.
 """
 
 IMAGES = {
+    "debian-13": {
+        "name": "Debian 13 (Trixie)",
+        "url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
+        "filename": "debian-13-generic-amd64.qcow2",
+        "format": "qcow2",
+        "os_family": "debian",
+    },
     "debian-12": {
         "name": "Debian 12 (Bookworm)",
         "url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2",
@@ -17,6 +24,13 @@ IMAGES = {
         "filename": "noble-server-cloudimg-amd64.img",
         "format": "qcow2",
         "os_family": "debian",
+    },
+    "alma-10": {
+        "name": "AlmaLinux 10",
+        "url": "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2",
+        "filename": "AlmaLinux-10-GenericCloud-latest.x86_64.qcow2",
+        "format": "qcow2",
+        "os_family": "redhat",
     },
     "alma-9": {
         "name": "AlmaLinux 9",

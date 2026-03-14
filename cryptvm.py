@@ -45,6 +45,18 @@ class WelcomeScreen(Screen):
             self.query_one("#root-warning", Static).update(
                 "[red bold]Warning: not running as root. Run with sudo.[/]"
             )
+        else:
+            # Check for missing utilities early
+            from builder import check_requirements
+            missing_bios = check_requirements("bios")
+            missing_uefi = check_requirements("uefi")
+
+            if missing_bios or missing_uefi:
+                all_missing = sorted(set(missing_bios + missing_uefi))
+                self.query_one("#root-warning", Static).update(
+                    f"[yellow bold]Warning: Missing utilities: {', '.join(all_missing)}[/]\n"
+                    f"Install with: apt install {' '.join(all_missing)}"
+                )
 
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "btn-start":
@@ -75,6 +87,12 @@ class ConfigScreen(Screen):
             yield Static("[b]SSH Public Key[/b]", classes="section-title")
             yield Static("Paste your public key (ssh-rsa ..., ssh-ed25519 ..., etc.)", classes="hint")
             yield TextArea(id="ssh-pubkey")
+
+            yield Rule()
+            yield Static("[b]Boot Mode[/b]", classes="section-title")
+            yield Static("BIOS: Legacy MBR boot (compatible with older systems)\nUEFI: Modern GPT boot (recommended for new systems)", classes="hint")
+            boot_options = [("BIOS (Legacy)", "bios"), ("UEFI (Modern)", "uefi")]
+            yield Select(boot_options, id="boot-mode-select", value="bios")
 
             yield Rule()
             yield Static("[b]Disk Size (MB)[/b]", classes="section-title")
@@ -141,6 +159,7 @@ class ConfigScreen(Screen):
                 "luks_password": self.query_one("#luks-password", Input).value,
                 "root_password": self.query_one("#root-password", Input).value,
                 "ssh_pubkey": self.query_one("#ssh-pubkey", TextArea).text.strip(),
+                "boot_mode": self.query_one("#boot-mode-select", Select).value,
                 "disk_size_mb": int(self.query_one("#disk-size", Input).value),
                 "output_path": self.query_one("#output-path", Input).value,
             }
@@ -212,7 +231,8 @@ class BuildScreen(Screen):
         # Check tools
         set_status("Checking requirements...")
         set_progress(5)
-        missing = check_requirements()
+        boot_mode = config.get("boot_mode", "bios")
+        missing = check_requirements(boot_mode)
         if missing:
             raise FileNotFoundError(f"Missing tools: {', '.join(missing)}\nInstall with: apt install {' '.join(missing)}")
         log("All required tools found.")
@@ -264,6 +284,8 @@ class BuildScreen(Screen):
             root_password=config["root_password"],
             ssh_pubkey=config["ssh_pubkey"],
             os_family=os_info["os_family"],
+            boot_mode=config.get("boot_mode", "bios"),
+            os_name=os_info["name"],
             log=build_log,
         )
 
@@ -302,6 +324,19 @@ class CryptVMApp(App):
 
 
 def main():
+    # Early check for missing utilities if running as root
+    if os.geteuid() == 0:
+        from builder import check_requirements
+        missing_bios = check_requirements("bios")
+        missing_uefi = check_requirements("uefi")
+
+        if missing_bios and missing_uefi:
+            # If both modes have missing utilities, exit with the combined list
+            all_missing = sorted(set(missing_bios + missing_uefi))
+            print(f"Error: Missing required utilities: {', '.join(all_missing)}")
+            print(f"Install with: sudo apt install {' '.join(all_missing)}")
+            sys.exit(1)
+
     CryptVMApp().run()
 
 

@@ -10,9 +10,13 @@ import textwrap
 from pathlib import Path
 
 
-def check_requirements() -> list[str]:
+def check_requirements(boot_mode: str = "bios") -> list[str]:
     """Check for required tools. Returns list of missing ones."""
     required = ["losetup", "cryptsetup", "parted", "mkfs.ext4", "mount", "chroot", "tar", "blkid"]
+
+    if boot_mode == "uefi":
+        required.extend(["mkfs.fat", "efibootmgr"])
+
     missing = [cmd for cmd in required if not shutil.which(cmd)]
     return missing
 
@@ -41,10 +45,12 @@ def build_image(
     root_password: str,
     ssh_pubkey: str,
     os_family: str,
+    boot_mode: str = "bios",
+    os_name: str = "Linux",
     log=None,
 ):
     """
-    Build a BIOS-bootable encrypted disk image.
+    Build a BIOS or UEFI-bootable encrypted disk image.
 
     cloud_image_raw: path to the raw cloud image
     output_path: where to write the final .img
@@ -53,6 +59,7 @@ def build_image(
     root_password: root user password
     ssh_pubkey: SSH public key for root
     os_family: "debian" or "redhat"
+    boot_mode: "bios" or "uefi"
     log: callable for status messages
     """
     if log is None:
@@ -61,7 +68,7 @@ def build_image(
     if not check_root():
         raise PermissionError("Must run as root (use sudo).")
 
-    missing = check_requirements()
+    missing = check_requirements(boot_mode)
     if missing:
         raise FileNotFoundError(f"Missing required tools: {', '.join(missing)}")
 
@@ -103,29 +110,58 @@ def build_image(
         log(f"Creating output disk ({disk_size_mb}MB)...")
         run(["dd", "if=/dev/zero", f"of={output_path}", "bs=1M", "count=1", "seek=" + str(disk_size_mb - 1)])
 
-        log("Creating MBR partition table...")
-        boot_end = 513  # 512MB boot + 1MB alignment
-        run(["parted", "-s", str(output_path), "mklabel", "msdos"])
-        run(["parted", "-s", str(output_path), "mkpart", "primary", "ext4", "1MiB", f"{boot_end}MiB"])
-        run(["parted", "-s", str(output_path), "mkpart", "primary", "ext4", f"{boot_end}MiB", "100%"])
-        run(["parted", "-s", str(output_path), "set", "1", "boot", "on"])
+        if boot_mode == "uefi":
+            log("Creating GPT partition table for UEFI...")
+            run(["parted", "-s", str(output_path), "mklabel", "gpt"])
+            # EFI System Partition (512MB)
+            run(["parted", "-s", str(output_path), "mkpart", "primary", "fat32", "1MiB", "513MiB"])
+            run(["parted", "-s", str(output_path), "set", "1", "esp", "on"])
+            # Boot partition (512MB)
+            run(["parted", "-s", str(output_path), "mkpart", "primary", "ext4", "513MiB", "1025MiB"])
+            # Root partition (rest)
+            run(["parted", "-s", str(output_path), "mkpart", "primary", "ext4", "1025MiB", "100%"])
+        else:
+            log("Creating MBR partition table for BIOS...")
+            boot_end = 513  # 512MB boot + 1MB alignment
+            run(["parted", "-s", str(output_path), "mklabel", "msdos"])
+            run(["parted", "-s", str(output_path), "mkpart", "primary", "ext4", "1MiB", f"{boot_end}MiB"])
+            run(["parted", "-s", str(output_path), "mkpart", "primary", "ext4", f"{boot_end}MiB", "100%"])
+            run(["parted", "-s", str(output_path), "set", "1", "boot", "on"])
 
         # Set up loop device with partitions
         loop_dev = run(["losetup", "--find", "--show", "--partscan", str(output_path)]).stdout.strip()
         subprocess.run(["partprobe", loop_dev], capture_output=True)
         subprocess.run(["sleep", "1"])
 
-        boot_dev = f"{loop_dev}p1"
-        root_dev = f"{loop_dev}p2"
+        if boot_mode == "uefi":
+            efi_dev = f"{loop_dev}p1"
+            boot_dev = f"{loop_dev}p2"
+            root_dev = f"{loop_dev}p3"
 
-        if not os.path.exists(boot_dev):
-            raise RuntimeError(f"Boot partition {boot_dev} not found. Loop device partitions not created.")
+            if not os.path.exists(boot_dev):
+                raise RuntimeError(f"Boot partition {boot_dev} not found. Loop device partitions not created.")
 
-        log(f"  Loop: {loop_dev}, boot: {boot_dev}, root: {root_dev}")
+            log(f"  Loop: {loop_dev}, EFI: {efi_dev}, boot: {boot_dev}, root: {root_dev}")
 
-        # ── Format boot ──────────────────────────────────────────────
-        log("Formatting /boot...")
-        run(["mkfs.ext4", "-L", "boot", boot_dev])
+            # ── Format EFI System Partition ──────────────────────────────
+            log("Formatting EFI System Partition...")
+            run(["mkfs.fat", "-F", "32", "-n", "EFI", efi_dev])
+
+            # ── Format boot ──────────────────────────────────────────────
+            log("Formatting /boot...")
+            run(["mkfs.ext4", "-L", "boot", boot_dev])
+        else:
+            boot_dev = f"{loop_dev}p1"
+            root_dev = f"{loop_dev}p2"
+
+            if not os.path.exists(boot_dev):
+                raise RuntimeError(f"Boot partition {boot_dev} not found. Loop device partitions not created.")
+
+            log(f"  Loop: {loop_dev}, boot: {boot_dev}, root: {root_dev}")
+
+            # ── Format boot ──────────────────────────────────────────────
+            log("Formatting /boot...")
+            run(["mkfs.ext4", "-L", "boot", boot_dev])
 
         # ── LUKS setup ───────────────────────────────────────────────
         log("Setting up LUKS1 encryption...")
@@ -159,14 +195,29 @@ def build_image(
         boot_files = list((target / "boot").glob("*"))
         log(f"  Found {len(boot_files)} files in rootfs /boot/")
 
+        # Mount EFI partition first for UEFI systems
+        if boot_mode == "uefi":
+            efi_dir = target / "boot" / "efi"
+            efi_dir.mkdir(parents=True, exist_ok=True)
+
         # Now mount the real /boot partition on top
         run(["mount", boot_dev, str(target / "boot")])
         mounts.append(str(target / "boot"))
+
+        # For UEFI, also mount the EFI System Partition
+        if boot_mode == "uefi":
+            efi_dir = target / "boot" / "efi"
+            efi_dir.mkdir(parents=True, exist_ok=True)
+            run(["mount", efi_dev, str(target / "boot" / "efi")])
+            mounts.append(str(target / "boot" / "efi"))
 
         # Move kernel/initrd/config/map files from root's boot into the partition
         # They were extracted to the encrypted root but are now hidden by the mount.
         # We need to read them from the underlying filesystem.
         # Unmount /boot briefly, copy files, remount.
+        if boot_mode == "uefi":
+            run(["umount", str(target / "boot" / "efi")])
+            mounts.remove(str(target / "boot" / "efi"))
         run(["umount", str(target / "boot")])
         mounts.remove(str(target / "boot"))
 
@@ -188,6 +239,13 @@ def build_image(
         # Remount the boot partition and copy files in
         run(["mount", boot_dev, str(target / "boot")])
         mounts.append(str(target / "boot"))
+
+        # Remount EFI partition for UEFI
+        if boot_mode == "uefi":
+            efi_dir = target / "boot" / "efi"
+            efi_dir.mkdir(parents=True, exist_ok=True)
+            run(["mount", efi_dev, str(target / "boot" / "efi")])
+            mounts.append(str(target / "boot" / "efi"))
 
         for item in boot_tmp.iterdir():
             dest = target / "boot" / item.name
@@ -214,12 +272,22 @@ def build_image(
         log(f"  LUKS UUID: {luks_uuid}")
         log(f"  Root UUID: {root_uuid}")
 
+        efi_uuid = None
+        if boot_mode == "uefi":
+            efi_uuid = run(["blkid", "-s", "UUID", "-o", "value", efi_dev]).stdout.strip()
+            log(f"  EFI UUID: {efi_uuid}")
+
         # ── Configure system ─────────────────────────────────────────
         log("Configuring fstab and crypttab...")
-        (target / "etc/fstab").write_text(
+        fstab_content = (
             f"UUID={root_uuid}  /      ext4  errors=remount-ro  0  1\n"
             f"UUID={boot_uuid}  /boot  ext4  defaults           0  2\n"
         )
+
+        if boot_mode == "uefi":
+            fstab_content += f"UUID={efi_uuid}  /boot/efi  vfat  defaults,umask=0077  0  2\n"
+
+        (target / "etc/fstab").write_text(fstab_content)
         (target / "etc/crypttab").write_text(
             f"cryptroot UUID={luks_uuid} none luks\n"
         )
@@ -227,6 +295,26 @@ def build_image(
         # ── Root password ────────────────────────────────────────────
         log("Setting root password...")
         _set_root_password(target, root_password)
+       
+        # ── SELinux - configure for proper first boot
+        if os_family == "redhat":
+            log("Configuring SELinux for first boot...")
+            selinux_config = target / "etc/selinux/config"
+            if selinux_config.exists():
+                content = selinux_config.read_text()
+                import re
+                # Set SELinux to permissive initially to avoid login issues
+                content = re.sub(r'^SELINUX=enforcing', 'SELINUX=permissive', content, flags=re.MULTILINE)
+                content = re.sub(r'^SELINUX=disabled', 'SELINUX=permissive', content, flags=re.MULTILINE)
+                selinux_config.write_text(content)
+                log("  Set SELinux to permissive mode for first boot")
+
+                # Create autorelabel file to trigger SELinux relabeling on first boot
+                (target / ".autorelabel").touch()
+                log("  Created .autorelabel for SELinux context restoration on first boot")
+                log("  Note: SELinux will remain in permissive mode - manually set to enforcing after first boot if desired")
+        else:
+            log("Skipping SELinux configuration for non-RHEL OS")
 
         # ── SSH ──────────────────────────────────────────────────────
         log("Configuring SSH...")
@@ -277,6 +365,19 @@ def build_image(
             link.unlink(missing_ok=True)
             link.symlink_to("/dev/null")
 
+        # ── Disable serial console configuration ─────────────────────
+        log("Disabling serial console configuration...")
+
+        # Disable getty on serial console
+        for service in ["serial-getty@ttyS0.service", "getty@ttyS0.service"]:
+            link = target / f"etc/systemd/system/getty.target.wants/{service}"
+            link.unlink(missing_ok=True)
+            # Also mask the service
+            link = target / f"etc/systemd/system/{service}"
+            link.unlink(missing_ok=True)
+            link.symlink_to("/dev/null")
+        log("  Disabled serial getty services")
+
         # ── Hostname / networking ────────────────────────────────────
         (target / "etc/hostname").write_text("cryptvm\n")
         (target / "etc/hosts").write_text(
@@ -312,7 +413,7 @@ def build_image(
         except Exception:
             resolv_target.write_text("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
 
-        chroot_script = _make_chroot_script(luks_uuid, os_family, loop_dev)
+        chroot_script = _make_chroot_script(luks_uuid, os_family, loop_dev, boot_mode, os_name)
         script_path = target / "tmp/setup-grub.sh"
         script_path.write_text(chroot_script)
         script_path.chmod(0o755)
@@ -358,7 +459,7 @@ def _find_root_partition(loop_dev: str) -> str:
     best_size = 0
 
     # Check partitions
-    for suffix in ["p1", "p2", "p3","p4", "1", "2", "3", "4"]:
+    for suffix in ["p1", "p2", "p3","p4", "1", "2", "3","4"]:
         dev = f"{loop_dev}{suffix}"
         if not os.path.exists(dev):
             continue
@@ -440,7 +541,7 @@ def _bind_mount(target: Path, mounts: list, loop_dev: str):
         mounts.append(dst)
 
 
-def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str) -> str:
+def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode: str = "bios", os_name: str = "Linux") -> str:
     """Generate the shell script that runs inside chroot."""
     return textwrap.dedent(f"""\
         #!/bin/bash
@@ -489,8 +590,13 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str) -> str:
                 fi
             fi
 
-            apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-pc \\
-                openssh-server 2>&1 || true
+            if [ "{boot_mode}" = "uefi" ]; then
+                apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-efi-amd64 grub-efi-amd64-bin efibootmgr \\
+                    openssh-server 2>&1 || true
+            else
+                apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-pc \\
+                    openssh-server 2>&1 || true
+            fi
             mkdir -p /etc/cryptsetup-initramfs
             echo "CRYPTSETUP=y" > /etc/cryptsetup-initramfs/conf-hook
 
@@ -503,18 +609,79 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str) -> str:
                 $PKG_MGR install -y kernel 2>&1 || true
             fi
 
-            $PKG_MGR install -y -q cryptsetup grub2 grub2-pc grub2-pc-modules \\
-                openssh-server 2>&1 || true
+            if [ "{boot_mode}" = "uefi" ]; then
+                $PKG_MGR install -y -q cryptsetup grub2-efi-x64 grub2-efi-x64-modules efibootmgr \\
+                    openssh-server 2>&1 || true
+            else
+                $PKG_MGR install -y -q cryptsetup grub2 grub2-pc grub2-pc-modules \\
+                    openssh-server 2>&1 || true
+            fi
+
+            # Disable os-prober to prevent finding host OS entries
+            echo "GRUB_DISABLE_OS_PROBER=true" >> /etc/default/grub
         fi
 
         echo "=== Checking /boot contents ==="
         ls -la /boot/
 
-        echo "=== Installing GRUB to MBR ==="
-        if command -v grub-install >/dev/null 2>&1; then
-            grub-install --target=i386-pc --boot-directory=/boot "{loop_dev}" 2>&1 || true
-        elif command -v grub2-install >/dev/null 2>&1; then
-            grub2-install --target=i386-pc --boot-directory=/boot "{loop_dev}" 2>&1 || true
+        if [ "{boot_mode}" = "uefi" ]; then
+            echo "=== Installing GRUB for UEFI ==="
+            if command -v grub-install >/dev/null 2>&1; then
+                # Let GRUB install normally to its default location
+                grub-install --target=x86_64-efi --efi-directory=/boot/efi --no-nvram 2>&1 || true
+            elif command -v grub2-install >/dev/null 2>&1; then
+                # For RHEL/AlmaLinux, we need to bypass the Secure Boot check
+                # Set environment variable to ignore the warning and proceed
+                export GRUB_DISABLE_SUBMENU=true
+                grub2-install --target=x86_64-efi --efi-directory=/boot/efi --no-nvram --force 2>&1 || true
+            fi
+
+            echo "=== Creating UEFI fallback boot ==="
+            # Create fallback boot entry for maximum compatibility
+            mkdir -p /boot/efi/EFI/BOOT
+
+            # Find the installed grubx64.efi and copy to fallback location
+            if [ -f /boot/efi/EFI/*/grubx64.efi ]; then
+                GRUB_EFI=$(find /boot/efi/EFI -name "grubx64.efi" | head -1)
+                cp "$GRUB_EFI" /boot/efi/EFI/BOOT/BOOTX64.EFI
+                echo "Created fallback BOOTX64.EFI from $GRUB_EFI"
+            else
+                # If grub2-install failed, manually create the EFI binary
+                echo "grub2-install failed, creating EFI binary manually..."
+                mkdir -p /boot/efi/EFI/almalinux
+
+                # Use grub2-mkimage to create the EFI binary
+                if command -v grub2-mkimage >/dev/null 2>&1; then
+                    grub2-mkimage -d /usr/lib/grub/x86_64-efi -O x86_64-efi \\
+                        --output=/boot/efi/EFI/almalinux/grubx64.efi \\
+                        --config-file=/dev/null \\
+                        part_gpt part_msdos ntfs ntfscomp hfsplus fat ext2 normal chain boot configfile linux \\
+                        multiboot reboot halt search search_fs_file search_fs_uuid search_label gfxterm gfxterm_background \\
+                        gfxterm_menu test all_video loadenv exfat ext4 btrfs lvm mdraid09 mdraid1x raid5rec raid6rec \\
+                        gcry_rijndael gcry_rsa gcry_serpent gcry_twofish gcry_arcfour gcry_blowfish gcry_cast5 \\
+                        gcry_crc gcry_des gcry_md4 gcry_md5 gcry_rfc2268 gcry_rmd160 gcry_seed gcry_sha1 \\
+                        gcry_sha256 gcry_sha512 gcry_tiger gcry_whirlpool luks cryptodisk 2>&1 || true
+
+                    if [ -f /boot/efi/EFI/almalinux/grubx64.efi ]; then
+                        cp /boot/efi/EFI/almalinux/grubx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
+                        echo "Created EFI binary manually with grub2-mkimage"
+                    fi
+                elif [ -f /usr/lib/grub/x86_64-efi/grub.efi ]; then
+                    # Last resort: use the generic grub.efi
+                    cp /usr/lib/grub/x86_64-efi/grub.efi /boot/efi/EFI/almalinux/grubx64.efi
+                    cp /usr/lib/grub/x86_64-efi/grub.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
+                    echo "Used generic grub.efi as fallback"
+                else
+                    echo "ERROR: Could not create UEFI bootloader"
+                fi
+            fi
+        else
+            echo "=== Installing GRUB to MBR ==="
+            if command -v grub-install >/dev/null 2>&1; then
+                grub-install --target=i386-pc --boot-directory=/boot "{loop_dev}" 2>&1 || true
+            elif command -v grub2-install >/dev/null 2>&1; then
+                grub2-install --target=i386-pc --boot-directory=/boot "{loop_dev}" 2>&1 || true
+            fi
         fi
 
         echo "=== Rebuilding initramfs with cryptsetup ==="
@@ -529,49 +696,148 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str) -> str:
             dracut --force --regenerate-all 2>&1 || dracut --force 2>&1 || true
         fi
 
-        echo "=== Writing grub.cfg manually ==="
-        # Do NOT use grub-mkconfig — it probes host devices.
-        # Write a minimal grub.cfg referencing only our image.
+        echo "=== Configuring GRUB ==="
 
-        VMLINUZ=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
-        # Some distros use unversioned symlinks
-        [ -z "$VMLINUZ" ] && [ -f /boot/vmlinuz ] && VMLINUZ="/boot/vmlinuz"
+        if [ "{os_family}" = "debian" ]; then
+            echo "Using Debian/Ubuntu update-grub workflow"
 
-        INITRD=$(ls -1 /boot/initrd.img-* /boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
-        [ -z "$INITRD" ] && [ -f /boot/initrd.img ] && INITRD="/boot/initrd.img"
+            # Get the root UUID first
+            sleep 2
+            ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot 2>/dev/null || echo "")
+            echo "Root filesystem UUID: $ROOT_UUID"
 
-        if [ -z "$VMLINUZ" ]; then
-            echo "ERROR: No kernel found in /boot after package install!"
-            echo "Contents of /boot:"
-            ls -la /boot/
-            echo "Installed kernel packages:"
-            dpkg -l | grep linux-image || rpm -qa | grep kernel || true
-            exit 1
-        fi
+            if [ -z "$ROOT_UUID" ]; then
+                ROOT_UUID=$(lsblk -no UUID /dev/mapper/cryptroot 2>/dev/null || echo "")
+                echo "Fallback UUID detection: $ROOT_UUID"
+            fi
 
-        VMLINUZ_BASE=$(basename "$VMLINUZ")
-        INITRD_BASE=$(basename "$INITRD")
-        echo "Kernel: $VMLINUZ_BASE"
-        echo "Initrd: $INITRD_BASE"
+            # Remove any existing serial console configuration from GRUB
+            if [ -f /etc/default/grub ]; then
+                cp /etc/default/grub /etc/default/grub.backup
+                sed -i 's/console=ttyS[0-9]*[^ ]*//g' /etc/default/grub
+                sed -i 's/earlyprintk=ttyS[0-9]*[^ ]*//g' /etc/default/grub
+                sed -i 's/consoleblank=0//g' /etc/default/grub
+                # Clean up extra spaces
+                sed -i 's/  */ /g' /etc/default/grub
+                sed -i 's/ *$//g' /etc/default/grub
+            fi
 
-        GRUB_DIR="/boot/grub"
-        [ -d /boot/grub2 ] && GRUB_DIR="/boot/grub2"
-        mkdir -p "$GRUB_DIR"
+            # Configure /etc/default/grub for encrypted boot
+            cat > /etc/default/grub << GRUB_DEFAULT
+        # GRUB configuration for encrypted boot - VGA console only
+        GRUB_DEFAULT=0
+        GRUB_TIMEOUT=10
+        GRUB_DISTRIBUTOR=\$(lsb_release -i -s 2>/dev/null || echo Debian)
+        GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+        GRUB_CMDLINE_LINUX="root=UUID=$ROOT_UUID"
+        GRUB_TERMINAL=console
+        GRUB_DISABLE_RECOVERY="true"
+        GRUB_DISABLE_OS_PROBER="true"
+        GRUB_ENABLE_CRYPTODISK=y
+        GRUB_DISABLE_LINUX_UUID="false"
+        # Explicitly disable serial console
+        GRUB_SERIAL_COMMAND=""
+        GRUB_DEFAULT
 
-        cat > "$GRUB_DIR/grub.cfg" << GRUBCFG
-        set timeout=5
+            # Also ensure /etc/fstab is correct for update-grub to detect
+            echo "Checking /etc/fstab for update-grub..."
+            if ! grep -q "UUID=$ROOT_UUID" /etc/fstab; then
+                echo "Fixing /etc/fstab root entry..."
+                sed -i "s|^[^ ]* / |UUID=$ROOT_UUID / |" /etc/fstab
+            fi
+
+            # Clean up GRUB scripts that might add serial console
+            echo "Cleaning GRUB scripts for serial console references..."
+            for script in /etc/grub.d/*; do
+                if [ -f "$script" ] && [ -x "$script" ]; then
+                    # Only modify lines that contain kernel parameters (typically GRUB_CMDLINE_LINUX)
+                    sed -i '/GRUB_CMDLINE_LINUX/ s/console=ttyS[0-9]*[^ ]*//g' "$script"
+                    sed -i '/GRUB_CMDLINE_LINUX/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' "$script"
+                    sed -i '/GRUB_CMDLINE_LINUX/ s/consoleblank=0//g' "$script"
+                fi
+            done
+
+            # Update GRUB configuration
+            echo "Running update-grub to generate configuration..."
+            update-grub 2>&1 || true
+
+            # Post-process the generated grub.cfg to remove any remaining serial console refs
+            echo "Post-processing generated GRUB config..."
+            if [ -f /boot/grub/grub.cfg ]; then
+                cp /boot/grub/grub.cfg /boot/grub/grub.cfg.backup
+                # Only modify lines that start with "linux" (kernel command lines)
+                sed -i '/^[[:space:]]*linux/ s/console=ttyS[0-9]*[^ ]*//g' /boot/grub/grub.cfg
+                sed -i '/^[[:space:]]*linux/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' /boot/grub/grub.cfg
+                sed -i '/^[[:space:]]*linux/ s/consoleblank=0//g' /boot/grub/grub.cfg
+                # Fix duplicate root= parameters only on linux lines
+                sed -i '/^[[:space:]]*linux/ s/root=[^ ]* root=/root=/g' /boot/grub/grub.cfg
+                # Clean up extra spaces only on linux lines
+                sed -i '/^[[:space:]]*linux/ s/  */ /g' /boot/grub/grub.cfg
+                sed -i '/^[[:space:]]*linux/ s/ *\$//' /boot/grub/grub.cfg
+            fi
+
+            # Debug: Show what was generated
+            echo "Generated GRUB config preview:"
+            grep -A5 -B5 "linux.*root=" /boot/grub/grub.cfg || true
+
+        else
+            echo "Using manual GRUB configuration for RHEL/AlmaLinux"
+
+            VMLINUZ=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
+            [ -z "$VMLINUZ" ] && [ -f /boot/vmlinuz ] && VMLINUZ="/boot/vmlinuz"
+
+            INITRD=$(ls -1 /boot/initrd.img-* /boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
+            [ -z "$INITRD" ] && [ -f /boot/initrd.img ] && INITRD="/boot/initrd.img"
+
+            if [ -z "$VMLINUZ" ]; then
+                echo "ERROR: No kernel found in /boot after package install!"
+                exit 1
+            fi
+
+            VMLINUZ_BASE=$(basename "$VMLINUZ")
+            INITRD_BASE=$(basename "$INITRD")
+            echo "Kernel: $VMLINUZ_BASE, Initrd: $INITRD_BASE"
+
+            GRUB_DIR="/boot/grub2"
+            mkdir -p "$GRUB_DIR"
+
+            if [ "{boot_mode}" = "uefi" ]; then
+                cat > "$GRUB_DIR/grub.cfg" << GRUBCFG
+        set timeout=10
         set default=0
+        set timeout_style=menu
 
-        menuentry "CryptVM (encrypted root)" {{
-            insmod part_msdos
+        menuentry "{os_name} (encrypted root)" {{
+            insmod part_gpt
+            insmod fat
             insmod ext2
-            set root='(hd0,msdos1)'
-            linux /$VMLINUZ_BASE root=/dev/mapper/cryptroot cryptdevice=UUID={luks_uuid}:cryptroot ro quiet
+            insmod cryptodisk
+            insmod luks
+            set root='(hd0,gpt2)'
+            linux /$VMLINUZ_BASE root=/dev/mapper/cryptroot ro quiet
             initrd /$INITRD_BASE
         }}
         GRUBCFG
+            else
+                cat > "$GRUB_DIR/grub.cfg" << GRUBCFG
+        set timeout=10
+        set default=0
+        set timeout_style=menu
 
-        echo "Written $GRUB_DIR/grub.cfg"
-        cat "$GRUB_DIR/grub.cfg"
+        menuentry "{os_name} (encrypted root)" {{
+            insmod part_msdos
+            insmod ext2
+            set root='(hd0,msdos1)'
+            linux /$VMLINUZ_BASE root=/dev/mapper/cryptroot ro quiet
+            initrd /$INITRD_BASE
+        }}
+        GRUBCFG
+            fi
+
+            echo "Written manual GRUB configuration"
+        fi
+
+        echo "=== GRUB configuration complete ==="
+
         echo "=== Chroot setup complete ==="
     """)

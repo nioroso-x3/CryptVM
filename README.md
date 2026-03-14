@@ -1,19 +1,18 @@
 # CryptVM Builder
 
-Vibe coded tool to build BIOS-bootable VM disk images with LUKS-encrypted root partitions from
+Tool to build BIOS or UEFI-bootable VM disk images with LUKS-encrypted root partitions from
 cloud images. Runs directly on Linux or WSL2 as root.
-
-Coded in one shot using Claude Opus 4.6 and some manual fixes.
 
 Easily automates creating encrypted images to use in any public cloud.
 
 ## Features
 
 - LUKS1 encrypted root partition, password-protected at boot
-- MBR + BIOS boot (no UEFI)
+- **Both BIOS (MBR) and UEFI (GPT) boot modes supported**
 - SSH root access via public key (password auth disabled)
 - Custom root password
 - Interactive TUI
+- Early dependency checking with helpful error messages
 
 ## Supported OS Images
 
@@ -25,13 +24,24 @@ Easily automates creating encrypted images to use in any public cloud.
 ## Prerequisites
 
 ```bash
-# Debian/Ubuntu
+# For BIOS mode (Debian/Ubuntu)
 sudo apt install qemu-utils cryptsetup parted e2fsprogs grub-pc-bin python3-pip
 
-# Fedora/RHEL
+# For UEFI mode (additional packages)
+sudo apt install grub-efi-amd64 grub-efi-amd64-bin efibootmgr dosfstools
+
+# For BIOS mode (Fedora/RHEL)
 sudo dnf install qemu-img cryptsetup parted e2fsprogs grub2-pc python3-pip
 
+# For UEFI mode (additional packages)
+sudo dnf install grub2-efi-x64 grub2-efi-x64-modules efibootmgr dosfstools
+
 pip install textual
+```
+
+You can also check dependencies with the included utility:
+```bash
+sudo python3 check_deps.py
 ```
 
 ## Usage
@@ -47,7 +57,11 @@ builds the encrypted disk image directly using losetup/cryptsetup/chroot.
 ## Booting the Image
 
 ```bash
+# BIOS mode
 qemu-system-x86_64 -hda output.img -m 1024
+
+# UEFI mode
+qemu-system-x86_64 -hda output.img -m 1024 -bios /usr/share/ovmf/OVMF.fd
 
 # With SSH forwarding:
 qemu-system-x86_64 \
@@ -62,10 +76,21 @@ You will be prompted for the LUKS passphrase once at boot by the initramfs.
 
 ## Disk Layout
 
+### BIOS Mode
     MBR partition table
     ├── Partition 1: /boot (ext4, 512MB, unencrypted)
     │   Kernel, initramfs, GRUB
     └── Partition 2: LUKS1 container (remainder)
+        └── ext4 filesystem: /
+            Full OS root, /root/.ssh/authorized_keys
+
+### UEFI Mode
+    GPT partition table
+    ├── Partition 1: EFI System Partition (fat32, 512MB, unencrypted)
+    │   UEFI bootloader, /boot/efi
+    ├── Partition 2: /boot (ext4, 512MB, unencrypted)
+    │   Kernel, initramfs, GRUB
+    └── Partition 3: LUKS1 container (remainder)
         └── ext4 filesystem: /
             Full OS root, /root/.ssh/authorized_keys
 
@@ -75,6 +100,7 @@ You will be prompted for the LUKS passphrase once at boot by the initramfs.
     builder.py     - Core build logic (losetup, cryptsetup, chroot)
     downloader.py  - Cloud image download with resume
     images.py      - OS image URL catalog
+    check_deps.py  - Standalone dependency checker
 
 ## License
 
