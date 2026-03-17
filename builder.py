@@ -47,6 +47,7 @@ def build_image(
     os_family: str,
     boot_mode: str = "bios",
     os_name: str = "Linux",
+    enable_cloud_init: bool = False,
     log=None,
 ):
     """
@@ -60,6 +61,7 @@ def build_image(
     ssh_pubkey: SSH public key for root
     os_family: "debian" or "redhat"
     boot_mode: "bios" or "uefi"
+    enable_cloud_init: enable cloud-init service (default: False)
     log: callable for status messages
     """
     if log is None:
@@ -355,15 +357,52 @@ def build_image(
                 link.unlink(missing_ok=True)
                 link.symlink_to(f"/lib/systemd/system/{svc}")
 
-        # ── Disable cloud-init ───────────────────────────────────────
-        log("Disabling cloud-init...")
-        (target / "etc/cloud").mkdir(parents=True, exist_ok=True)
-        (target / "etc/cloud/cloud-init.disabled").touch()
-        for svc in ["cloud-init.service", "cloud-init-local.service",
-                     "cloud-config.service", "cloud-final.service"]:
-            link = target / f"etc/systemd/system/{svc}"
-            link.unlink(missing_ok=True)
-            link.symlink_to("/dev/null")
+        # ── Configure cloud-init ─────────────────────────────────────
+        if enable_cloud_init:
+            log("Enabling cloud-init...")
+            cloud_dir = target / "etc/cloud"
+            cloud_dir.mkdir(parents=True, exist_ok=True)
+
+            # Remove cloud-init.disabled file if it exists
+            disabled_file = cloud_dir / "cloud-init.disabled"
+            disabled_file.unlink(missing_ok=True)
+
+            # Enable cloud-init services by removing any mask links
+            for svc in ["cloud-init.service", "cloud-init-local.service",
+                       "cloud-config.service", "cloud-final.service"]:
+                link = target / f"etc/systemd/system/{svc}"
+                link.unlink(missing_ok=True)
+
+            # Enable services in systemd
+            systemd_wants_multi = target / "etc/systemd/system/multi-user.target.wants"
+            systemd_wants_multi.mkdir(parents=True, exist_ok=True)
+            systemd_wants_cloud = target / "etc/systemd/system/cloud-init.target.wants"
+            systemd_wants_cloud.mkdir(parents=True, exist_ok=True)
+
+            for svc in ["cloud-init.service", "cloud-config.service", "cloud-final.service"]:
+                svc_path = target / f"lib/systemd/system/{svc}"
+                if svc_path.exists():
+                    link = systemd_wants_multi / svc
+                    link.unlink(missing_ok=True)
+                    link.symlink_to(f"/lib/systemd/system/{svc}")
+
+            # cloud-init-local.service should be enabled for local.target
+            svc_local = "cloud-init-local.service"
+            svc_local_path = target / f"lib/systemd/system/{svc_local}"
+            if svc_local_path.exists():
+                link = target / f"etc/systemd/system/sysinit.target.wants/{svc_local}"
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.unlink(missing_ok=True)
+                link.symlink_to(f"/lib/systemd/system/{svc_local}")
+        else:
+            log("Disabling cloud-init...")
+            (target / "etc/cloud").mkdir(parents=True, exist_ok=True)
+            (target / "etc/cloud/cloud-init.disabled").touch()
+            for svc in ["cloud-init.service", "cloud-init-local.service",
+                         "cloud-config.service", "cloud-final.service"]:
+                link = target / f"etc/systemd/system/{svc}"
+                link.unlink(missing_ok=True)
+                link.symlink_to("/dev/null")
 
         # ── Disable serial console configuration ─────────────────────
         log("Disabling serial console configuration...")

@@ -36,7 +36,12 @@ sudo dnf install qemu-img cryptsetup parted e2fsprogs grub2-pc python3-pip
 # For UEFI mode (additional packages)
 sudo dnf install grub2-efi-x64 grub2-efi-x64-modules efibootmgr dosfstools
 
-pip install textual
+
+#create a virtualenv as root
+virtualenv cryptvm
+
+#install requirements
+pip install -r requirements.txt
 ```
 
 You can also check dependencies with the included utility:
@@ -47,7 +52,7 @@ sudo python3 check_deps.py
 ## Usage
 
 ```bash
-sudo python3 cryptvm.py
+python3 cryptvm.py
 ```
 
 The TUI guides you through selecting an OS, setting passwords, and providing
@@ -97,6 +102,7 @@ You will be prompted for the LUKS passphrase once at boot by the initramfs.
 ## Files
 
     cryptvm.py     - TUI entry point
+    build-image.py - CLI entry point
     builder.py     - Core build logic (losetup, cryptsetup, chroot)
     downloader.py  - Cloud image download with resume
     images.py      - OS image URL catalog

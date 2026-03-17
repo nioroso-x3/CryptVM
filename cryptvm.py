@@ -103,6 +103,12 @@ class ConfigScreen(Screen):
             yield Input(placeholder="output.img", value="output.img", id="output-path")
 
             yield Rule()
+            yield Static("[b]Cloud-Init[/b]", classes="section-title")
+            yield Static("Enable cloud-init service (leave disabled for manual configuration)", classes="hint")
+            cloud_init_options = [("Disabled (default)", False), ("Enabled", True)]
+            yield Select(cloud_init_options, id="cloud-init-select", value=False)
+
+            yield Rule()
             yield Static("", id="validation-msg")
             with Horizontal(id="config-buttons"):
                 yield Button("Back", id="btn-back")
@@ -162,6 +168,7 @@ class ConfigScreen(Screen):
                 "boot_mode": self.query_one("#boot-mode-select", Select).value,
                 "disk_size_mb": int(self.query_one("#disk-size", Input).value),
                 "output_path": self.query_one("#output-path", Input).value,
+                "enable_cloud_init": self.query_one("#cloud-init-select", Select).value,
             }
             self.app.push_screen(BuildScreen(config))
 
@@ -286,6 +293,7 @@ class BuildScreen(Screen):
             os_family=os_info["os_family"],
             boot_mode=config.get("boot_mode", "bios"),
             os_name=os_info["name"],
+            enable_cloud_init=config.get("enable_cloud_init", False),
             log=build_log,
         )
 

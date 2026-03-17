@@ -93,6 +93,12 @@ Available OS images:""" + "\n  " + "\n  ".join([f"{key}: {info['name']}" for key
         help="Check dependencies and exit"
     )
 
+    parser.add_argument(
+        "--enable-cloud-init",
+        action="store_true",
+        help="Enable cloud-init in the image (disabled by default)"
+    )
+
     args = parser.parse_args()
 
     # Check if running as root
@@ -187,6 +193,7 @@ Available OS images:""" + "\n  " + "\n  ".join([f"{key}: {info['name']}" for key
             os_family=os_info["os_family"],
             boot_mode=args.boot_mode,
             os_name=os_info["name"],
+            enable_cloud_init=args.enable_cloud_init,
             log=print,
         )
 
