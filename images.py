@@ -18,6 +18,13 @@ IMAGES = {
         "format": "qcow2",
         "os_family": "debian",
     },
+    "ubuntu-2604": {
+        "name": "Ubuntu 26.04 LTS (Resolute)",
+        "url": "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img",
+        "filename": "resolute-server-cloudimg-amd64.img",
+        "format": "qcow2",
+        "os_family": "debian",
+    },
     "ubuntu-2404": {
         "name": "Ubuntu 24.04 LTS (Noble)",
         "url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",

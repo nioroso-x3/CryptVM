@@ -48,6 +48,7 @@ def build_image(
     boot_mode: str = "bios",
     os_name: str = "Linux",
     enable_cloud_init: bool = False,
+    enable_serial: bool = False,
     log=None,
 ):
     """
@@ -297,7 +298,7 @@ def build_image(
         # ── Root password ────────────────────────────────────────────
         log("Setting root password...")
         _set_root_password(target, root_password)
-       
+
         # ── SELinux - configure for proper first boot
         if os_family == "redhat":
             log("Configuring SELinux for first boot...")
@@ -305,13 +306,11 @@ def build_image(
             if selinux_config.exists():
                 content = selinux_config.read_text()
                 import re
-                # Set SELinux to permissive initially to avoid login issues
                 content = re.sub(r'^SELINUX=enforcing', 'SELINUX=permissive', content, flags=re.MULTILINE)
                 content = re.sub(r'^SELINUX=disabled', 'SELINUX=permissive', content, flags=re.MULTILINE)
                 selinux_config.write_text(content)
                 log("  Set SELinux to permissive mode for first boot")
 
-                # Create autorelabel file to trigger SELinux relabeling on first boot
                 (target / ".autorelabel").touch()
                 log("  Created .autorelabel for SELinux context restoration on first boot")
                 log("  Note: SELinux will remain in permissive mode - manually set to enforcing after first boot if desired")
@@ -363,17 +362,14 @@ def build_image(
             cloud_dir = target / "etc/cloud"
             cloud_dir.mkdir(parents=True, exist_ok=True)
 
-            # Remove cloud-init.disabled file if it exists
             disabled_file = cloud_dir / "cloud-init.disabled"
             disabled_file.unlink(missing_ok=True)
 
-            # Enable cloud-init services by removing any mask links
             for svc in ["cloud-init.service", "cloud-init-local.service",
                        "cloud-config.service", "cloud-final.service"]:
                 link = target / f"etc/systemd/system/{svc}"
                 link.unlink(missing_ok=True)
 
-            # Enable services in systemd
             systemd_wants_multi = target / "etc/systemd/system/multi-user.target.wants"
             systemd_wants_multi.mkdir(parents=True, exist_ok=True)
             systemd_wants_cloud = target / "etc/systemd/system/cloud-init.target.wants"
@@ -386,7 +382,6 @@ def build_image(
                     link.unlink(missing_ok=True)
                     link.symlink_to(f"/lib/systemd/system/{svc}")
 
-            # cloud-init-local.service should be enabled for local.target
             svc_local = "cloud-init-local.service"
             svc_local_path = target / f"lib/systemd/system/{svc_local}"
             if svc_local_path.exists():
@@ -404,18 +399,18 @@ def build_image(
                 link.unlink(missing_ok=True)
                 link.symlink_to("/dev/null")
 
-        # ── Disable serial console configuration ─────────────────────
-        log("Disabling serial console configuration...")
-
-        # Disable getty on serial console
-        for service in ["serial-getty@ttyS0.service", "getty@ttyS0.service"]:
-            link = target / f"etc/systemd/system/getty.target.wants/{service}"
-            link.unlink(missing_ok=True)
-            # Also mask the service
-            link = target / f"etc/systemd/system/{service}"
-            link.unlink(missing_ok=True)
-            link.symlink_to("/dev/null")
-        log("  Disabled serial getty services")
+        # ── Serial console configuration ─────────────────────────────
+        if not enable_serial:
+            log("Disabling serial console configuration...")
+            for service in ["serial-getty@ttyS0.service", "getty@ttyS0.service"]:
+                link = target / f"etc/systemd/system/getty.target.wants/{service}"
+                link.unlink(missing_ok=True)
+                link = target / f"etc/systemd/system/{service}"
+                link.unlink(missing_ok=True)
+                link.symlink_to("/dev/null")
+            log("  Disabled serial getty services")
+        else:
+            log("Keeping serial console enabled")
 
         # ── Hostname / networking ────────────────────────────────────
         (target / "etc/hostname").write_text("cryptvm\n")
@@ -452,7 +447,7 @@ def build_image(
         except Exception:
             resolv_target.write_text("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
 
-        chroot_script = _make_chroot_script(luks_uuid, os_family, loop_dev, boot_mode, os_name)
+        chroot_script = _make_chroot_script(luks_uuid, os_family, loop_dev, boot_mode, os_name, enable_serial)
         script_path = target / "tmp/setup-grub.sh"
         script_path.write_text(chroot_script)
         script_path.chmod(0o755)
@@ -540,7 +535,6 @@ def _set_root_password(target: Path, password: str):
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        log("Changing root password using openssl")
         # Fallback: use openssl to generate hash and patch /etc/shadow
         hash_result = subprocess.run(
             ["openssl", "passwd", "-6", "-stdin"],
@@ -555,8 +549,6 @@ def _set_root_password(target: Path, password: str):
                 text = shadow.read_text()
                 text = re.sub(r'^root:[^:]*:', f'root:{pw_hash}:', text, flags=re.MULTILINE)
                 shadow.write_text(text)
-        else:
-            log("Failed to set root password")
 
 def _bind_mount(target: Path, mounts: list, loop_dev: str):
     """Bind-mount /dev, /proc, /sys, /run into the chroot.
@@ -580,7 +572,7 @@ def _bind_mount(target: Path, mounts: list, loop_dev: str):
         mounts.append(dst)
 
 
-def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode: str = "bios", os_name: str = "Linux") -> str:
+def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode: str = "bios", os_name: str = "Linux", enable_serial: bool = False) -> str:
     """Generate the shell script that runs inside chroot."""
     return textwrap.dedent(f"""\
         #!/bin/bash
@@ -630,9 +622,19 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
             fi
 
             if [ "{boot_mode}" = "uefi" ]; then
-                apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-efi-amd64 grub-efi-amd64-bin efibootmgr \\
+                # Remove cloud/BIOS GRUB variants that conflict with UEFI GRUB.
+                # grub-cloud-amd64 is Debian's cloud-specific package that assumes
+                # BIOS boot — its postinst runs grub-install --target=i386-pc which
+                # fails on GPT/UEFI disks with no BIOS Boot Partition.
+                echo "Removing conflicting GRUB packages..."
+                apt-get remove -y --purge grub-cloud-amd64 grub-pc grub-pc-bin 2>&1 || true
+                apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-efi-amd64 grub-efi-amd64-bin \
+                    grub-efi-amd64-signed shim-signed efibootmgr \
                     openssh-server 2>&1 || true
             else
+                # For BIOS mode, remove UEFI GRUB if present
+                echo "Removing conflicting GRUB packages..."
+                apt-get remove -y --purge grub-cloud-amd64 grub-efi-amd64 grub-efi-amd64-bin 2>&1 || true
                 apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-pc \\
                     openssh-server 2>&1 || true
             fi
@@ -649,15 +651,35 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
             fi
 
             if [ "{boot_mode}" = "uefi" ]; then
-                $PKG_MGR install -y -q cryptsetup grub2-efi-x64 grub2-efi-x64-modules efibootmgr \\
-                    openssh-server 2>&1 || true
+                $PKG_MGR install -y -q cryptsetup grub2-efi-x64 grub2-efi-x64-modules \
+                    shim-x64 efibootmgr openssh-server 2>&1 || true
             else
                 $PKG_MGR install -y -q cryptsetup grub2 grub2-pc grub2-pc-modules \\
                     openssh-server 2>&1 || true
             fi
 
-            # Disable os-prober to prevent finding host OS entries
-            echo "GRUB_DISABLE_OS_PROBER=true" >> /etc/default/grub
+            # ── RHEL: Configure /etc/default/grub with rd.luks.* params ──
+            # This is critical for surviving kernel updates. When dnf installs
+            # a new kernel, it runs grub2-mkconfig which reads /etc/default/grub.
+            # Without rd.luks.uuid in GRUB_CMDLINE_LINUX, the new grub.cfg
+            # won't have LUKS parameters and the system won't boot.
+            echo "Configuring /etc/default/grub for LUKS..."
+            cat > /etc/default/grub << 'GRUB_RHEL_STATIC'
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
+GRUB_DEFAULT=saved
+GRUB_DISABLE_SUBMENU=true
+GRUB_DISABLE_OS_PROBER=true
+GRUB_DISABLE_RECOVERY=true
+GRUB_RHEL_STATIC
+            {"" if enable_serial else "echo 'GRUB_TERMINAL_OUTPUT=\"console\"' >> /etc/default/grub"}
+            {"echo 'GRUB_TERMINAL_OUTPUT=\"serial console\"' >> /etc/default/grub" if enable_serial else ""}
+            {"echo 'GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"' >> /etc/default/grub" if enable_serial else ""}
+            # Append the LUKS-specific kernel cmdline with the actual UUID
+            echo 'GRUB_CMDLINE_LINUX="rd.luks.uuid={luks_uuid} rd.luks.name={luks_uuid}=cryptroot root=/dev/mapper/cryptroot{"" if not enable_serial else " console=ttyS0,115200 console=tty0"}"' >> /etc/default/grub
+            echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"' >> /etc/default/grub
+            echo "Written /etc/default/grub:"
+            cat /etc/default/grub
         fi
 
         echo "=== Checking /boot contents ==="
@@ -666,54 +688,106 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
         if [ "{boot_mode}" = "uefi" ]; then
             echo "=== Installing GRUB for UEFI ==="
             if command -v grub-install >/dev/null 2>&1; then
-                # Let GRUB install normally to its default location
                 grub-install --target=x86_64-efi --efi-directory=/boot/efi --no-nvram 2>&1 || true
             elif command -v grub2-install >/dev/null 2>&1; then
-                # For RHEL/AlmaLinux, we need to bypass the Secure Boot check
-                # Set environment variable to ignore the warning and proceed
                 export GRUB_DISABLE_SUBMENU=true
                 grub2-install --target=x86_64-efi --efi-directory=/boot/efi --no-nvram --force 2>&1 || true
             fi
 
-            echo "=== Creating UEFI fallback boot ==="
-            # Create fallback boot entry for maximum compatibility
+            echo "=== Setting up UEFI boot chain (shim + GRUB) ==="
             mkdir -p /boot/efi/EFI/BOOT
 
-            # Find the installed grubx64.efi and copy to fallback location
-            if [ -f /boot/efi/EFI/*/grubx64.efi ]; then
-                GRUB_EFI=$(find /boot/efi/EFI -name "grubx64.efi" | head -1)
-                cp "$GRUB_EFI" /boot/efi/EFI/BOOT/BOOTX64.EFI
-                echo "Created fallback BOOTX64.EFI from $GRUB_EFI"
-            else
-                # If grub2-install failed, manually create the EFI binary
-                echo "grub2-install failed, creating EFI binary manually..."
-                mkdir -p /boot/efi/EFI/almalinux
+            # Detect the distro-specific EFI directory
+            EFI_DISTRO_DIR=""
+            for d in /boot/efi/EFI/*/; do
+                dname=$(basename "$d")
+                case "$dname" in
+                    BOOT|boot) continue ;;
+                    *) EFI_DISTRO_DIR="$d"; break ;;
+                esac
+            done
 
-                # Use grub2-mkimage to create the EFI binary
-                if command -v grub2-mkimage >/dev/null 2>&1; then
-                    grub2-mkimage -d /usr/lib/grub/x86_64-efi -O x86_64-efi \\
-                        --output=/boot/efi/EFI/almalinux/grubx64.efi \\
-                        --config-file=/dev/null \\
-                        part_gpt part_msdos ntfs ntfscomp hfsplus fat ext2 normal chain boot configfile linux \\
-                        multiboot reboot halt search search_fs_file search_fs_uuid search_label gfxterm gfxterm_background \\
-                        gfxterm_menu test all_video loadenv exfat ext4 btrfs lvm mdraid09 mdraid1x raid5rec raid6rec \\
-                        gcry_rijndael gcry_rsa gcry_serpent gcry_twofish gcry_arcfour gcry_blowfish gcry_cast5 \\
-                        gcry_crc gcry_des gcry_md4 gcry_md5 gcry_rfc2268 gcry_rmd160 gcry_seed gcry_sha1 \\
-                        gcry_sha256 gcry_sha512 gcry_tiger gcry_whirlpool luks cryptodisk 2>&1 || true
-
-                    if [ -f /boot/efi/EFI/almalinux/grubx64.efi ]; then
-                        cp /boot/efi/EFI/almalinux/grubx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
-                        echo "Created EFI binary manually with grub2-mkimage"
-                    fi
-                elif [ -f /usr/lib/grub/x86_64-efi/grub.efi ]; then
-                    # Last resort: use the generic grub.efi
-                    cp /usr/lib/grub/x86_64-efi/grub.efi /boot/efi/EFI/almalinux/grubx64.efi
-                    cp /usr/lib/grub/x86_64-efi/grub.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
-                    echo "Used generic grub.efi as fallback"
+            if [ -z "$EFI_DISTRO_DIR" ]; then
+                # Create one based on OS family
+                if [ "{os_family}" = "debian" ]; then
+                    EFI_DISTRO_DIR="/boot/efi/EFI/ubuntu"
                 else
-                    echo "ERROR: Could not create UEFI bootloader"
+                    EFI_DISTRO_DIR="/boot/efi/EFI/almalinux"
                 fi
+                mkdir -p "$EFI_DISTRO_DIR"
             fi
+            echo "EFI distro directory: $EFI_DISTRO_DIR"
+
+            # Find shimx64.efi — this is the Secure Boot signed first-stage loader
+            SHIM=""
+            for candidate in \\
+                "$EFI_DISTRO_DIR/shimx64.efi" \\
+                /boot/efi/EFI/*/shimx64.efi \\
+                /usr/lib/shim/shimx64.efi \\
+                /usr/lib/shim/shimx64.efi.signed \\
+                /usr/share/shim-signed/shimx64.efi.signed \\
+                /usr/share/shim/shimx64.efi; do
+                if [ -f "$candidate" ]; then
+                    SHIM="$candidate"
+                    break
+                fi
+            done
+
+            # Find grubx64.efi
+            GRUB_EFI=""
+            for candidate in \\
+                "$EFI_DISTRO_DIR/grubx64.efi" \\
+                /boot/efi/EFI/*/grubx64.efi \\
+                /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \\
+                /usr/share/grub/x86_64-efi-signed/grubx64.efi.signed; do
+                if [ -f "$candidate" ]; then
+                    GRUB_EFI="$candidate"
+                    break
+                fi
+            done
+
+            echo "Found shim: $SHIM"
+            echo "Found GRUB EFI: $GRUB_EFI"
+
+            if [ -n "$SHIM" ]; then
+                # Copy shim to the distro dir and fallback
+                cp "$SHIM" "$EFI_DISTRO_DIR/shimx64.efi" 2>/dev/null || true
+                cp "$SHIM" /boot/efi/EFI/BOOT/BOOTX64.EFI
+                echo "Installed shimx64.efi as BOOTX64.EFI (Secure Boot chain)"
+
+                # Copy grubx64.efi next to the shim (shim loads grubx64.efi from same dir)
+                if [ -n "$GRUB_EFI" ]; then
+                    cp "$GRUB_EFI" "$EFI_DISTRO_DIR/grubx64.efi" 2>/dev/null || true
+                    cp "$GRUB_EFI" /boot/efi/EFI/BOOT/grubx64.efi
+                    echo "Installed grubx64.efi alongside shim"
+                fi
+
+                # Also copy mmx64.efi (MOK manager) if available
+                for mok in "$EFI_DISTRO_DIR/mmx64.efi" /usr/lib/shim/mmx64.efi /usr/share/shim-signed/mmx64.efi.signed; do
+                    if [ -f "$mok" ]; then
+                        cp "$mok" "$EFI_DISTRO_DIR/mmx64.efi" 2>/dev/null || true
+                        cp "$mok" /boot/efi/EFI/BOOT/mmx64.efi
+                        echo "Installed mmx64.efi (MOK manager)"
+                        break
+                    fi
+                done
+            elif [ -n "$GRUB_EFI" ]; then
+                # No shim available — fall back to unsigned GRUB as BOOTX64.EFI
+                # This works with OVMF without Secure Boot or with it disabled
+                cp "$GRUB_EFI" /boot/efi/EFI/BOOT/BOOTX64.EFI
+                echo "WARNING: No shim found. Installed unsigned grubx64.efi as BOOTX64.EFI"
+                echo "  This will NOT work with Secure Boot enabled."
+                echo "  Use OVMF without Secure Boot or install shim-x64/shim-signed."
+            else
+                echo "ERROR: Neither shim nor GRUB EFI binary found!"
+                echo "  Checking what's on the ESP:"
+                find /boot/efi -type f -name "*.efi" 2>/dev/null || true
+                echo "  Checking installed packages:"
+                rpm -qa | grep -i -E "shim|grub.*efi" 2>/dev/null || dpkg -l | grep -i -E "shim|grub.*efi" 2>/dev/null || true
+            fi
+
+            echo "Final EFI layout:"
+            find /boot/efi -type f 2>/dev/null | sort
         else
             echo "=== Installing GRUB to MBR ==="
             if command -v grub-install >/dev/null 2>&1; then
@@ -727,12 +801,32 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
         if command -v update-initramfs >/dev/null 2>&1; then
             update-initramfs -u -k all 2>&1 || true
         elif command -v dracut >/dev/null 2>&1; then
+            # Configure dracut to always include LUKS support in every initramfs.
+            # This is critical: without it, kernel updates via dnf produce
+            # initramfs images that can't unlock the encrypted root.
             mkdir -p /etc/dracut.conf.d
-            cat > /etc/dracut.conf.d/99-cryptvm.conf << 'DRACUT'
-        add_dracutmodules+=" crypt dm rootfs-block "
-        install_items+=" /etc/crypttab "
-        DRACUT
+            cat > /etc/dracut.conf.d/99-cryptvm.conf << DRACUT
+add_dracutmodules+=" crypt dm rootfs-block "
+install_items+=" /etc/crypttab /usr/sbin/cryptsetup "
+DRACUT
+
+            echo "Dracut config:"
+            cat /etc/dracut.conf.d/99-cryptvm.conf
+
+            # Verify /etc/crypttab is correct (dracut reads this to know which
+            # devices to unlock — the kernel cmdline rd.luks.uuid tells it
+            # which UUID, and crypttab tells it the mapping name)
+            echo "Crypttab:"
+            cat /etc/crypttab
+
             dracut --force --regenerate-all 2>&1 || dracut --force 2>&1 || true
+
+            # Verify the initramfs actually contains cryptsetup
+            echo "Checking initramfs contents for cryptsetup..."
+            LATEST_INITRD=$(ls -1 /boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
+            if [ -n "$LATEST_INITRD" ]; then
+                lsinitrd "$LATEST_INITRD" 2>/dev/null | grep -i crypt | head -5 || true
+            fi
         fi
 
         echo "=== Configuring GRUB ==="
@@ -740,7 +834,6 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
         if [ "{os_family}" = "debian" ]; then
             echo "Using Debian/Ubuntu update-grub workflow"
 
-            # Get the root UUID first
             sleep 2
             ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot 2>/dev/null || echo "")
             echo "Root filesystem UUID: $ROOT_UUID"
@@ -750,133 +843,181 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
                 echo "Fallback UUID detection: $ROOT_UUID"
             fi
 
-            # Remove any existing serial console configuration from GRUB
             if [ -f /etc/default/grub ]; then
                 cp /etc/default/grub /etc/default/grub.backup
-                sed -i 's/console=ttyS[0-9]*[^ ]*//g' /etc/default/grub
-                sed -i 's/earlyprintk=ttyS[0-9]*[^ ]*//g' /etc/default/grub
-                sed -i 's/consoleblank=0//g' /etc/default/grub
-                # Clean up extra spaces
-                sed -i 's/  */ /g' /etc/default/grub
-                sed -i 's/ *$//g' /etc/default/grub
+                if [ "{"true" if not enable_serial else "false"}" = "true" ]; then
+                    echo "Stripping serial console from existing GRUB config..."
+                    sed -i 's/console=ttyS[0-9]*[^ ]*//g' /etc/default/grub
+                    sed -i 's/earlyprintk=ttyS[0-9]*[^ ]*//g' /etc/default/grub
+                    sed -i 's/consoleblank=0//g' /etc/default/grub
+                    sed -i 's/  */ /g' /etc/default/grub
+                    sed -i 's/ *$//g' /etc/default/grub
+                fi
             fi
 
-            # Configure /etc/default/grub for encrypted boot
             cat > /etc/default/grub << GRUB_DEFAULT
-        # GRUB configuration for encrypted boot - VGA console only
-        GRUB_DEFAULT=0
-        GRUB_TIMEOUT=10
-        GRUB_DISTRIBUTOR=\$(lsb_release -i -s 2>/dev/null || echo Debian)
-        GRUB_CMDLINE_LINUX_DEFAULT="quiet"
-        GRUB_CMDLINE_LINUX="root=UUID=$ROOT_UUID"
-        GRUB_TERMINAL=console
-        GRUB_DISABLE_RECOVERY="true"
-        GRUB_DISABLE_OS_PROBER="true"
-        GRUB_ENABLE_CRYPTODISK=y
-        GRUB_DISABLE_LINUX_UUID="false"
-        # Explicitly disable serial console
-        GRUB_SERIAL_COMMAND=""
-        GRUB_DEFAULT
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=10
+GRUB_DISTRIBUTOR=$(lsb_release -i -s 2>/dev/null || echo Debian)
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX="root=UUID=$ROOT_UUID"
+{"GRUB_TERMINAL=console" if not enable_serial else 'GRUB_TERMINAL="serial console"\\nGRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"'}
+GRUB_DISABLE_RECOVERY="true"
+GRUB_DISABLE_OS_PROBER="true"
+GRUB_ENABLE_CRYPTODISK=y
+GRUB_DISABLE_LINUX_UUID="false"
+GRUB_DEFAULT
 
-            # Also ensure /etc/fstab is correct for update-grub to detect
-            echo "Checking /etc/fstab for update-grub..."
             if ! grep -q "UUID=$ROOT_UUID" /etc/fstab; then
                 echo "Fixing /etc/fstab root entry..."
                 sed -i "s|^[^ ]* / |UUID=$ROOT_UUID / |" /etc/fstab
             fi
 
-            # Clean up GRUB scripts that might add serial console
-            echo "Cleaning GRUB scripts for serial console references..."
-            for script in /etc/grub.d/*; do
-                if [ -f "$script" ] && [ -x "$script" ]; then
-                    # Only modify lines that contain kernel parameters (typically GRUB_CMDLINE_LINUX)
-                    sed -i '/GRUB_CMDLINE_LINUX/ s/console=ttyS[0-9]*[^ ]*//g' "$script"
-                    sed -i '/GRUB_CMDLINE_LINUX/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' "$script"
-                    sed -i '/GRUB_CMDLINE_LINUX/ s/consoleblank=0//g' "$script"
-                fi
-            done
+            if [ "{"true" if not enable_serial else "false"}" = "true" ]; then
+                echo "Cleaning GRUB scripts for serial console references..."
+                for script in /etc/grub.d/*; do
+                    if [ -f "$script" ] && [ -x "$script" ]; then
+                        sed -i '/GRUB_CMDLINE_LINUX/ s/console=ttyS[0-9]*[^ ]*//g' "$script"
+                        sed -i '/GRUB_CMDLINE_LINUX/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' "$script"
+                        sed -i '/GRUB_CMDLINE_LINUX/ s/consoleblank=0//g' "$script"
+                    fi
+                done
+            fi
 
-            # Update GRUB configuration
             echo "Running update-grub to generate configuration..."
             update-grub 2>&1 || true
 
-            # Post-process the generated grub.cfg to remove any remaining serial console refs
-            echo "Post-processing generated GRUB config..."
-            if [ -f /boot/grub/grub.cfg ]; then
-                cp /boot/grub/grub.cfg /boot/grub/grub.cfg.backup
-                # Only modify lines that start with "linux" (kernel command lines)
-                sed -i '/^[[:space:]]*linux/ s/console=ttyS[0-9]*[^ ]*//g' /boot/grub/grub.cfg
-                sed -i '/^[[:space:]]*linux/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' /boot/grub/grub.cfg
-                sed -i '/^[[:space:]]*linux/ s/consoleblank=0//g' /boot/grub/grub.cfg
-                # Fix duplicate root= parameters only on linux lines
-                sed -i '/^[[:space:]]*linux/ s/root=[^ ]* root=/root=/g' /boot/grub/grub.cfg
-                # Clean up extra spaces only on linux lines
-                sed -i '/^[[:space:]]*linux/ s/  */ /g' /boot/grub/grub.cfg
-                sed -i '/^[[:space:]]*linux/ s/ *\$//' /boot/grub/grub.cfg
+            if [ "{"true" if not enable_serial else "false"}" = "true" ]; then
+                echo "Post-processing generated GRUB config..."
+                if [ -f /boot/grub/grub.cfg ]; then
+                    cp /boot/grub/grub.cfg /boot/grub/grub.cfg.backup
+                    sed -i '/^[[:space:]]*linux/ s/console=ttyS[0-9]*[^ ]*//g' /boot/grub/grub.cfg
+                    sed -i '/^[[:space:]]*linux/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' /boot/grub/grub.cfg
+                    sed -i '/^[[:space:]]*linux/ s/consoleblank=0//g' /boot/grub/grub.cfg
+                    sed -i '/^[[:space:]]*linux/ s/root=[^ ]* root=/root=/g' /boot/grub/grub.cfg
+                    sed -i '/^[[:space:]]*linux/ s/  */ /g' /boot/grub/grub.cfg
+                    sed -i '/^[[:space:]]*linux/ s/ *$//' /boot/grub/grub.cfg
+                fi
             fi
 
-            # Debug: Show what was generated
             echo "Generated GRUB config preview:"
             grep -A5 -B5 "linux.*root=" /boot/grub/grub.cfg || true
 
         else
-            echo "Using manual GRUB configuration for RHEL/AlmaLinux"
+            echo "Using RHEL grub2-mkconfig workflow"
 
-            VMLINUZ=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
-            [ -z "$VMLINUZ" ] && [ -f /boot/vmlinuz ] && VMLINUZ="/boot/vmlinuz"
+            # For RHEL 9+/AlmaLinux 9+, Boot Loader Specification (BLS) is the
+            # default. The kernel cmdline lives in /boot/loader/entries/*.conf,
+            # NOT in grub.cfg. grub.cfg just loads the BLS entries.
+            # We must update BOTH grub.cfg AND the BLS entries.
 
-            INITRD=$(ls -1 /boot/initrd.img-* /boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
-            [ -z "$INITRD" ] && [ -f /boot/initrd.img ] && INITRD="/boot/initrd.img"
+            LUKS_CMDLINE="rd.luks.uuid={luks_uuid} rd.luks.name={luks_uuid}=cryptroot root=/dev/mapper/cryptroot"
 
-            if [ -z "$VMLINUZ" ]; then
-                echo "ERROR: No kernel found in /boot after package install!"
-                exit 1
+            # Update BLS entries directly — this is what actually controls
+            # the kernel command line on modern RHEL
+            echo "Checking for BLS entries..."
+            if [ -d /boot/loader/entries ]; then
+                echo "BLS entries found:"
+                ls -la /boot/loader/entries/
+
+                for entry in /boot/loader/entries/*.conf; do
+                    [ -f "$entry" ] || continue
+                    echo "Updating BLS entry: $entry"
+
+                    # Check if options line already has rd.luks.uuid
+                    if grep -q "rd.luks.uuid" "$entry"; then
+                        echo "  Already has LUKS params, skipping"
+                    else
+                        # Append LUKS params to the options line
+                        sed -i "s|^options \\(.*\\)|options \\1 $LUKS_CMDLINE|" "$entry"
+                        echo "  Added LUKS params to options line"
+                    fi
+
+                    # Show the result
+                    grep "^options" "$entry"
+                done
             fi
 
-            VMLINUZ_BASE=$(basename "$VMLINUZ")
-            INITRD_BASE=$(basename "$INITRD")
-            echo "Kernel: $VMLINUZ_BASE, Initrd: $INITRD_BASE"
+            if command -v grub2-mkconfig >/dev/null 2>&1; then
+                GRUB_CFG="/boot/grub2/grub.cfg"
+                [ "{boot_mode}" = "uefi" ] && GRUB_CFG="/boot/efi/EFI/almalinux/grub.cfg"
+                [ "{boot_mode}" = "uefi" ] && [ ! -d /boot/efi/EFI/almalinux ] && \\
+                    GRUB_CFG="/boot/grub2/grub.cfg"
 
-            GRUB_DIR="/boot/grub2"
-            mkdir -p "$GRUB_DIR"
+                echo "Generating GRUB config at $GRUB_CFG..."
+                # --update-bls-cmdline propagates GRUB_CMDLINE_LINUX to BLS entries
+                grub2-mkconfig -o "$GRUB_CFG" --update-bls-cmdline 2>&1 || \\
+                grub2-mkconfig -o "$GRUB_CFG" 2>&1 || true
 
-            if [ "{boot_mode}" = "uefi" ]; then
-                cat > "$GRUB_DIR/grub.cfg" << GRUBCFG
-        set timeout=10
-        set default=0
-        set timeout_style=menu
+                # Verify BLS entries have LUKS params after grub2-mkconfig
+                if [ -d /boot/loader/entries ]; then
+                    echo "Verifying BLS entries after grub2-mkconfig..."
+                    for entry in /boot/loader/entries/*.conf; do
+                        [ -f "$entry" ] || continue
+                        if ! grep -q "rd.luks.uuid" "$entry"; then
+                            echo "  WARNING: $entry still missing LUKS params, fixing..."
+                            sed -i "s|^options \\(.*\\)|options \\1 $LUKS_CMDLINE|" "$entry"
+                        fi
+                        echo "  $(basename $entry): $(grep '^options' $entry)"
+                    done
+                fi
 
-        menuentry "{os_name} (encrypted root)" {{
-            insmod part_gpt
-            insmod fat
-            insmod ext2
-            insmod cryptodisk
-            insmod luks
-            set root='(hd0,gpt2)'
-            linux /$VMLINUZ_BASE root=/dev/mapper/cryptroot ro quiet
-            initrd /$INITRD_BASE
-        }}
-        GRUBCFG
-            else
-                cat > "$GRUB_DIR/grub.cfg" << GRUBCFG
-        set timeout=10
-        set default=0
-        set timeout_style=menu
+                # Also verify grub.cfg itself
+                echo "Verifying GRUB config has LUKS parameters..."
+                if grep -q "rd.luks.uuid" "$GRUB_CFG" 2>/dev/null; then
+                    echo "OK: rd.luks.uuid found in grub.cfg"
+                elif [ -d /boot/loader/entries ] && grep -rq "rd.luks.uuid" /boot/loader/entries/ 2>/dev/null; then
+                    echo "OK: rd.luks.uuid found in BLS entries (grub.cfg uses BLS)"
+                else
+                    echo "WARNING: rd.luks.uuid NOT found anywhere, writing manual fallback..."
+                    VMLINUZ=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
+                    [ -z "$VMLINUZ" ] && [ -f /boot/vmlinuz ] && VMLINUZ="/boot/vmlinuz"
+                    INITRD=$(ls -1 /boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
+                    [ -z "$INITRD" ] && [ -f /boot/initrd.img ] && INITRD="/boot/initrd.img"
 
-        menuentry "{os_name} (encrypted root)" {{
-            insmod part_msdos
-            insmod ext2
-            set root='(hd0,msdos1)'
-            linux /$VMLINUZ_BASE root=/dev/mapper/cryptroot ro quiet
-            initrd /$INITRD_BASE
-        }}
-        GRUBCFG
+                    if [ -n "$VMLINUZ" ]; then
+                        VMLINUZ_BASE=$(basename "$VMLINUZ")
+                        INITRD_BASE=$(basename "$INITRD")
+
+                        if [ "{boot_mode}" = "uefi" ]; then
+                            cat > "$GRUB_CFG" << GRUBCFG
+set timeout=10
+set default=0
+
+menuentry "{os_name} (encrypted root)" {{
+    insmod part_gpt
+    insmod fat
+    insmod ext2
+    set root='(hd0,gpt2)'
+    linux /$VMLINUZ_BASE $LUKS_CMDLINE ro quiet
+    initrd /$INITRD_BASE
+}}
+GRUBCFG
+                        else
+                            cat > "$GRUB_CFG" << GRUBCFG
+set timeout=10
+set default=0
+
+menuentry "{os_name} (encrypted root)" {{
+    insmod part_msdos
+    insmod ext2
+    set root='(hd0,msdos1)'
+    linux /$VMLINUZ_BASE $LUKS_CMDLINE ro quiet
+    initrd /$INITRD_BASE
+}}
+GRUBCFG
+                        fi
+                        echo "Written manual fallback grub.cfg"
+                    fi
+                fi
+
+                echo "GRUB config preview:"
+                grep -A3 "linux.*root=\\|^options" "$GRUB_CFG" 2>/dev/null || true
+                echo "BLS entries preview:"
+                grep "^options" /boot/loader/entries/*.conf 2>/dev/null || echo "No BLS entries"
             fi
-
-            echo "Written manual GRUB configuration"
         fi
 
         echo "=== GRUB configuration complete ==="
-
         echo "=== Chroot setup complete ==="
     """)
