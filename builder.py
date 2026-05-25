@@ -638,8 +638,46 @@ def _make_chroot_script(luks_uuid: str, os_family: str, loop_dev: str, boot_mode
                 apt-get install -y -qq cryptsetup cryptsetup-initramfs grub-pc \\
                     openssh-server 2>&1 || true
             fi
+            # Ensure cryptsetup is always included in initramfs for ALL kernels,
+            # including HWE kernels installed later. This needs multiple hooks:
             mkdir -p /etc/cryptsetup-initramfs
             echo "CRYPTSETUP=y" > /etc/cryptsetup-initramfs/conf-hook
+
+            # Also set ASKPASS=y to ensure the password prompt is included
+            if ! grep -q "^ASKPASS=y" /etc/cryptsetup-initramfs/conf-hook 2>/dev/null; then
+                echo "ASKPASS=y" >> /etc/cryptsetup-initramfs/conf-hook
+            fi
+
+            # Create an initramfs-tools hook to force cryptsetup inclusion.
+            # This survives kernel changes because initramfs-tools runs all
+            # hooks in /etc/initramfs-tools/hooks/ for every kernel.
+            mkdir -p /etc/initramfs-tools/hooks
+            cat > /etc/initramfs-tools/hooks/cryptvm-force-cryptsetup << 'HOOKEOF'
+#!/bin/sh
+PREREQ="cryptroot"
+prereqs() {{ echo "$PREREQ"; }}
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+# Force copy cryptsetup and related binaries
+copy_exec /sbin/cryptsetup /sbin
+copy_exec /sbin/dmsetup /sbin
+exit 0
+HOOKEOF
+            chmod +x /etc/initramfs-tools/hooks/cryptvm-force-cryptsetup
+
+            # Ensure the initramfs-tools conf includes the cryptroot script
+            mkdir -p /etc/initramfs-tools/conf.d
+            echo "CRYPTROOT=target=cryptroot,source=UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot 2>/dev/null || echo UNKNOWN)" \
+                > /etc/initramfs-tools/conf.d/cryptvm.conf 2>/dev/null || true
+
+            # If dracut is also installed (some Ubuntu variants), configure it too
+            if command -v dracut >/dev/null 2>&1; then
+                mkdir -p /etc/dracut.conf.d
+                cat > /etc/dracut.conf.d/99-cryptvm.conf << 'DRACUTCONF'
+add_dracutmodules+=" crypt dm rootfs-block "
+install_items+=" /etc/crypttab /usr/sbin/cryptsetup "
+DRACUTCONF
+            fi
 
         elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
             PKG_MGR="dnf"
@@ -860,12 +898,12 @@ GRUB_DEFAULT=0
 GRUB_TIMEOUT=10
 GRUB_DISTRIBUTOR=$(lsb_release -i -s 2>/dev/null || echo Debian)
 GRUB_CMDLINE_LINUX_DEFAULT="quiet"
-GRUB_CMDLINE_LINUX="root=UUID=$ROOT_UUID"
+GRUB_CMDLINE_LINUX="root=/dev/mapper/cryptroot"
 {"GRUB_TERMINAL=console" if not enable_serial else 'GRUB_TERMINAL="serial console"\\nGRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"'}
 GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_OS_PROBER="true"
 GRUB_ENABLE_CRYPTODISK=y
-GRUB_DISABLE_LINUX_UUID="false"
+GRUB_DISABLE_LINUX_UUID="true"
 GRUB_DEFAULT
 
             if ! grep -q "UUID=$ROOT_UUID" /etc/fstab; then
@@ -874,14 +912,39 @@ GRUB_DEFAULT
             fi
 
             if [ "{"true" if not enable_serial else "false"}" = "true" ]; then
-                echo "Cleaning GRUB scripts for serial console references..."
+                echo "Stripping serial console from all GRUB config sources..."
+
+                # Clean /etc/grub.d/ scripts
                 for script in /etc/grub.d/*; do
                     if [ -f "$script" ] && [ -x "$script" ]; then
-                        sed -i '/GRUB_CMDLINE_LINUX/ s/console=ttyS[0-9]*[^ ]*//g' "$script"
-                        sed -i '/GRUB_CMDLINE_LINUX/ s/earlyprintk=ttyS[0-9]*[^ ]*//g' "$script"
-                        sed -i '/GRUB_CMDLINE_LINUX/ s/consoleblank=0//g' "$script"
+                        sed -i 's/console=ttyS[0-9]*[,0-9]*//g' "$script"
+                        sed -i 's/earlyprintk=ttyS[0-9]*[,0-9]*//g' "$script"
+                        sed -i 's/consoleblank=0//g' "$script"
                     fi
                 done
+
+                # Clean /etc/default/grub.d/ drop-in files — cloud images put
+                # serial console config here and it survives update-grub
+                if [ -d /etc/default/grub.d ]; then
+                    for f in /etc/default/grub.d/*.cfg /etc/default/grub.d/*.conf; do
+                        [ -f "$f" ] || continue
+                        echo "  Cleaning $f"
+                        sed -i 's/console=ttyS[0-9]*[,0-9]*//g' "$f"
+                        sed -i 's/earlyprintk=ttyS[0-9]*[,0-9]*//g' "$f"
+                        sed -i 's/consoleblank=0//g' "$f"
+                        # Also strip any GRUB_SERIAL_COMMAND or serial terminal config
+                        sed -i '/GRUB_SERIAL_COMMAND/d' "$f"
+                        sed -i 's/GRUB_TERMINAL=.*/GRUB_TERMINAL=console/' "$f"
+                        # Clean up double spaces
+                        sed -i 's/  */ /g' "$f"
+                        sed -i 's/ *"/"/g' "$f"
+                    done
+                fi
+
+                # Also clean /etc/kernel/cmdline if it exists (used by some systems)
+                if [ -f /etc/kernel/cmdline ]; then
+                    sed -i 's/console=ttyS[0-9]*[,0-9]*//g' /etc/kernel/cmdline
+                fi
             fi
 
             echo "Running update-grub to generate configuration..."
